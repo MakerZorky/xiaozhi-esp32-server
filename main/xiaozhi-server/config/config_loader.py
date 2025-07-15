@@ -1,12 +1,7 @@
 import os
-import argparse
 import yaml
 from collections.abc import Mapping
 from config.manage_api_client import init_service, get_server_config, get_agent_models
-
-
-# 添加全局配置缓存
-_config_cache = None
 
 
 def get_project_dir():
@@ -22,9 +17,12 @@ def read_config(config_path):
 
 def load_config():
     """加载配置文件"""
-    global _config_cache
-    if _config_cache is not None:
-        return _config_cache
+    from core.utils.cache.manager import cache_manager, CacheType
+
+    # 检查缓存
+    cached_config = cache_manager.get(CacheType.CONFIG, "main_config")
+    if cached_config is not None:
+        return cached_config
 
     default_config_path = get_project_dir() + "config.yaml"
     custom_config_path = get_project_dir() + "data/.config.yaml"
@@ -40,7 +38,9 @@ def load_config():
         config = merge_configs(default_config, custom_config)
     # 初始化目录
     ensure_directories(config)
-    _config_cache = config
+
+    # 缓存配置
+    cache_manager.set(CacheType.CONFIG, "main_config", config)
     return config
 
 
@@ -59,10 +59,14 @@ def get_config_from_api(config):
         "url": config["manager-api"].get("url", ""),
         "secret": config["manager-api"].get("secret", ""),
     }
+    # server的配置以本地为准
     if config.get("server"):
         config_data["server"] = {
             "ip": config["server"].get("ip", ""),
             "port": config["server"].get("port", ""),
+            "http_port": config["server"].get("http_port", ""),
+            "vision_explain": config["server"].get("vision_explain", ""),
+            "auth_key": config["server"].get("auth_key", ""),
         }
     return config_data
 

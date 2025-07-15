@@ -3,6 +3,9 @@ import socket
 import subprocess
 import re
 import os
+import wave
+from io import BytesIO
+from core.utils import p3
 import numpy as np
 import requests
 import opuslib_next
@@ -93,11 +96,23 @@ def is_private_ip(ip_addr):
 
 def get_ip_info(ip_addr, logger):
     try:
+        # 导入全局缓存管理器
+        from core.utils.cache.manager import cache_manager, CacheType
+
+        # 先从缓存获取
+        cached_ip_info = cache_manager.get(CacheType.IP_INFO, ip_addr)
+        if cached_ip_info is not None:
+            return cached_ip_info
+
+        # 缓存未命中，调用API
         if is_private_ip(ip_addr):
             ip_addr = ""
         url = f"https://whois.pconline.com.cn/ipJson.jsp?json=true&ip={ip_addr}"
         resp = requests.get(url).json()
         ip_info = {"city": resp.get("city")}
+
+        # 存入缓存
+        cache_manager.set(CacheType.IP_INFO, ip_addr, ip_info)
         return ip_info
     except Exception as e:
         logger.bind(tag=TAG).error(f"Error getting client ip info: {e}")
@@ -183,10 +198,8 @@ def remove_punctuation_and_length(text):
 
 def check_model_key(modelType, modelKey):
     if "你" in modelKey:
-        raise ValueError(
-            "你还没配置" + modelType + "的密钥，请检查一下所使用的LLM是否配置了密钥"
-        )
-    return True
+        return f"配置错误: {modelType} 的 API key 未设置,当前值为: {modelKey}"
+    return None
 
 
 def parse_string_to_list(value, separator=";"):
@@ -773,6 +786,24 @@ def audio_to_data(audio_file_path, is_opus=True):
     return pcm_to_data(raw_data, is_opus), duration
 
 
+def audio_bytes_to_data(audio_bytes, file_type, is_opus=True):
+    """
+    直接用音频二进制数据转为opus/pcm数据，支持wav、mp3、p3
+    """
+    if file_type == "p3":
+        # 直接用p3解码
+        return p3.decode_opus_from_bytes(audio_bytes)
+    else:
+        # 其他格式用pydub
+        audio = AudioSegment.from_file(
+            BytesIO(audio_bytes), format=file_type, parameters=["-nostdin"]
+        )
+        audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
+        duration = len(audio) / 1000.0
+        raw_data = audio.raw_data
+        return pcm_to_data(raw_data, is_opus), duration
+
+
 def pcm_to_data(raw_data, is_opus=True):
     # 初始化Opus编码器
     encoder = opuslib_next.Encoder(16000, 1, opuslib_next.APPLICATION_AUDIO)
@@ -802,6 +833,33 @@ def pcm_to_data(raw_data, is_opus=True):
         datas.append(frame_data)
 
     return datas
+
+
+def opus_datas_to_wav_bytes(opus_datas, sample_rate=16000, channels=1):
+    """
+    将opus帧列表解码为wav字节流
+    """
+    decoder = opuslib_next.Decoder(sample_rate, channels)
+    pcm_datas = []
+
+    frame_duration = 60  # ms
+    frame_size = int(sample_rate * frame_duration / 1000)  # 960
+
+    for opus_frame in opus_datas:
+        # 解码为PCM（返回bytes，2字节/采样点）
+        pcm = decoder.decode(opus_frame, frame_size)
+        pcm_datas.append(pcm)
+
+    pcm_bytes = b"".join(pcm_datas)
+
+    # 写入wav字节流
+    wav_buffer = BytesIO()
+    with wave.open(wav_buffer, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)  # 16bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return wav_buffer.getvalue()
 
 
 def check_vad_update(before_config, new_config):
@@ -882,3 +940,82 @@ def filter_sensitive_info(config: dict) -> dict:
         return filtered
 
     return _filter_dict(copy.deepcopy(config))
+
+
+def get_vision_url(config: dict) -> str:
+    """获取 vision URL
+
+    Args:
+        config: 配置字典
+
+    Returns:
+        str: vision URL
+    """
+    server_config = config["server"]
+    vision_explain = server_config.get("vision_explain", "")
+    if "你的" in vision_explain:
+        local_ip = get_local_ip()
+        port = int(server_config.get("http_port", 8003))
+        vision_explain = f"http://{local_ip}:{port}/mcp/vision/explain"
+    return vision_explain
+
+
+def is_valid_image_file(file_data: bytes) -> bool:
+    """
+    检查文件数据是否为有效的图片格式
+
+    Args:
+        file_data: 文件的二进制数据
+
+    Returns:
+        bool: 如果是有效的图片格式返回True，否则返回False
+    """
+    # 常见图片格式的魔数（文件头）
+    image_signatures = {
+        b"\xff\xd8\xff": "JPEG",
+        b"\x89PNG\r\n\x1a\n": "PNG",
+        b"GIF87a": "GIF",
+        b"GIF89a": "GIF",
+        b"BM": "BMP",
+        b"II*\x00": "TIFF",
+        b"MM\x00*": "TIFF",
+        b"RIFF": "WEBP",
+    }
+
+    # 检查文件头是否匹配任何已知的图片格式
+    for signature in image_signatures:
+        if file_data.startswith(signature):
+            return True
+
+    return False
+
+
+def sanitize_tool_name(name: str) -> str:
+    """Sanitize tool names for OpenAI compatibility."""
+    # 支持中文、英文字母、数字、下划线和连字符
+    return re.sub(r"[^a-zA-Z0-9_\-\u4e00-\u9fff]", "_", name)
+
+
+def validate_mcp_endpoint(mcp_endpoint: str) -> bool:
+    """
+    校验MCP接入点格式
+
+    Args:
+        mcp_endpoint: MCP接入点字符串
+
+    Returns:
+        bool: 是否有效
+    """
+    # 1. 检查是否以ws开头
+    if not mcp_endpoint.startswith("ws"):
+        return False
+
+    # 2. 检查是否包含key、call字样
+    if "key" in mcp_endpoint.lower() or "call" in mcp_endpoint.lower():
+        return False
+
+    # 3. 检查是否包含/mcp/字样
+    if "/mcp/" not in mcp_endpoint:
+        return False
+
+    return True
